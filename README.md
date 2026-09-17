@@ -21,6 +21,12 @@ Set the following as platform secrets or environment variables before deployment
 
 Optional Google OAuth variables are documented in `.env.example` when working locally. Reset-email delivery is intentionally disabled until a real email provider is configured.
 
+## Admin control room
+
+Administrators can open `/admin` after signing in with the configured admin account. The control room now shows the user directory, account roles and status, active sessions, SQLite/database size and writeability, dataset availability, Python runtime health, station data quality, and model guardrails. Database-backed users can be suspended or restored; suspending an account revokes its active sessions. Environment-configured accounts remain protected from in-panel suspension and must be changed through project secrets.
+
+The admin password form validates the current password, stores a rotated password hash in the auth database, and revokes existing admin sessions. Use the **Refresh data** control to re-read all health and user information.
+
 ## Local development
 
 ```bash
@@ -43,4 +49,4 @@ The production image runs `pnpm run build` itself, serves `dist/public`, and lis
 
 ## Launch notes
 
-The included SQLite auth store is appropriate for local development and a single persistent instance. For multi-instance production registration, migrate these auth endpoints to the project’s managed MySQL/TiDB database or attach persistent storage; Cloud Run’s local filesystem is not durable across instance replacement. The read-only station CSV remains packaged with the image.
+The included SQLite auth store is appropriate for local development and a single persistent instance. For multi-instance production registration and durable admin user management, migrate these auth endpoints to the project’s managed MySQL/TiDB database or attach persistent storage; Cloud Run’s local filesystem is not durable across instance replacement. The read-only station CSV remains packaged with the image.

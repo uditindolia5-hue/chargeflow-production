@@ -5,13 +5,14 @@ import json
 import hashlib
 import base64
 import hmac
+import platform
 import sqlite3
 import time
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import RedirectResponse
@@ -95,6 +96,13 @@ class PasswordResetConfirm(BaseModel):
     token: str = Field(min_length=16, max_length=200)
     password: str = Field(min_length=8, max_length=200)
 
+class AccountStatusRequest(BaseModel):
+    status: Literal["active", "suspended"]
+
+class AdminPasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=8, max_length=200)
+
 SESSIONS: dict[str, dict[str, str]] = {}
 REVOKED_SESSIONS: set[str] = set()
 SESSION_SECRET = (SESSION_SECRET_VALUE or "local-development-session-secret").encode()
@@ -106,8 +114,12 @@ def auth_db() -> sqlite3.Connection:
     AUTH_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(AUTH_DB_PATH)
     connection.row_factory = sqlite3.Row
-    connection.execute("CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', created_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS password_resets (token TEXT PRIMARY KEY, email TEXT NOT NULL, expires_at INTEGER NOT NULL)")
+    try:
+        connection.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    except sqlite3.OperationalError:
+        pass
     connection.commit()
     return connection
 
@@ -124,16 +136,23 @@ def verify_password(password: str, stored: str) -> bool:
     except (ValueError, TypeError):
         return False
 
-def configured_accounts() -> dict[str, dict[str, str]]:
+def environment_accounts() -> dict[str, dict[str, str]]:
     accounts: dict[str, dict[str, str]] = {}
     for role, prefix in (("user", "CHARGEFLOW_USER"), ("admin", "CHARGEFLOW_ADMIN")):
         email = os.getenv(f"{prefix}_EMAIL", "").strip().lower()
         password = os.getenv(f"{prefix}_PASSWORD", "")
         if email and password:
-            accounts[role] = {"email": email, "password": password, "role": role}
+            accounts[role] = {"email": email, "password": password, "role": role, "status": "active"}
+    return accounts
+
+def configured_accounts() -> dict[str, dict[str, str]]:
+    accounts = environment_accounts()
     with auth_db() as connection:
-        for row in connection.execute("SELECT email, name, password_hash, role FROM users").fetchall():
-            accounts[row["email"]] = {"email": row["email"], "password": row["password_hash"], "role": row["role"], "name": row["name"], "hashed": "true"}
+        for row in connection.execute("SELECT email, name, password_hash, role, status FROM users").fetchall():
+            for key, account in list(accounts.items()):
+                if account["email"].lower() == row["email"].lower():
+                    accounts.pop(key, None)
+            accounts[row["email"]] = {"email": row["email"], "password": row["password_hash"], "role": row["role"], "name": row["name"], "status": row["status"], "hashed": "true"}
     return accounts
 
 def create_session(email: str, role: str, name: str = "") -> str:
@@ -165,6 +184,52 @@ def current_session(authorization: str | None) -> dict[str, str]:
         return session
     except (ValueError, KeyError, TypeError, json.JSONDecodeError, base64.binascii.Error):
         raise HTTPException(status_code=401, detail="You must log in first")
+
+def require_admin(authorization: str | None) -> dict[str, str]:
+    session = current_session(authorization)
+    if session["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return session
+
+def revoke_sessions_for_email(email: str) -> None:
+    normalized = email.lower()
+    for token, session in list(SESSIONS.items()):
+        if session.get("email", "").lower() == normalized:
+            SESSIONS.pop(token, None)
+            REVOKED_SESSIONS.add(token)
+
+def is_environment_account(email: str) -> bool:
+    normalized = email.lower()
+    return any(os.getenv(f"{prefix}_EMAIL", "").strip().lower() == normalized for prefix in ("CHARGEFLOW_USER", "CHARGEFLOW_ADMIN"))
+
+def admin_user_rows() -> list[dict[str, Any]]:
+    configured = environment_accounts()
+    users: dict[str, dict[str, Any]] = {}
+    for role, account in configured.items():
+        email = account["email"].lower()
+        users[email] = {
+            "email": email,
+            "name": account.get("name") or ("Configured admin" if role == "admin" else "Configured user"),
+            "role": account.get("role", role),
+            "status": account.get("status", "active"),
+            "source": "environment",
+            "created_at": None,
+            "active_session": any(item.get("email", "").lower() == email for item in SESSIONS.values()),
+        }
+    with auth_db() as connection:
+        for row in connection.execute("SELECT email, name, role, status, created_at FROM users ORDER BY created_at DESC").fetchall():
+            email = row["email"].lower()
+            if email not in users:
+                users[email] = {
+                    "email": email,
+                    "name": row["name"],
+                    "role": row["role"],
+                    "status": row["status"],
+                    "source": "sqlite",
+                    "created_at": row["created_at"],
+                    "active_session": any(item.get("email", "").lower() == email for item in SESSIONS.values()),
+                }
+    return list(users.values())
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -240,7 +305,7 @@ def health() -> dict[str, Any]:
 @app.post("/auth/login")
 def login(request: LoginRequest) -> dict[str, str]:
     normalized_email = request.email.strip().lower()
-    account = next((value | {"role": value.get("role", role)} for role, value in configured_accounts().items() if value["email"].lower() == normalized_email and (verify_password(request.password, value["password"]) if value.get("hashed") else secrets.compare_digest(value["password"], request.password))), None)
+    account = next((value | {"role": value.get("role", role)} for role, value in configured_accounts().items() if value["email"].lower() == normalized_email and value.get("status", "active") == "active" and (verify_password(request.password, value["password"]) if value.get("hashed") else secrets.compare_digest(value["password"], request.password))), None)
     if not account:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_session(normalized_email, account["role"], account.get("name", ""))
@@ -256,7 +321,7 @@ def register(request: RegisterRequest) -> dict[str, str]:
     if normalized_email in {value["email"].lower() for value in configured_accounts().values()}:
         raise HTTPException(status_code=409, detail="An account with this email already exists")
     with auth_db() as connection:
-        connection.execute("INSERT INTO users (email, name, password_hash, role, created_at) VALUES (?, ?, ?, 'user', ?)", (normalized_email, request.name.strip(), hash_password(request.password), int(time.time())))
+        connection.execute("INSERT INTO users (email, name, password_hash, role, status, created_at) VALUES (?, ?, ?, 'user', 'active', ?)", (normalized_email, request.name.strip(), hash_password(request.password), int(time.time())))
         connection.commit()
     token = create_session(normalized_email, "user", request.name.strip())
     return {"token": token, "email": normalized_email, "role": "user"}
@@ -339,16 +404,71 @@ def logout(authorization: str | None = Header(default=None)) -> dict[str, bool]:
 
 @app.get("/admin/overview")
 def admin_overview(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    session = current_session(authorization)
-    if session["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    return {"station_count": len(STATIONS), "cities": len({station["city"] for station in STATIONS}), "dataset": DATASET_PATH.name, "active_sessions": len(SESSIONS)}
+    require_admin(authorization)
+    users = admin_user_rows()
+    return {"station_count": len(STATIONS), "cities": len({station["city"] for station in STATIONS}), "dataset": DATASET_PATH.name, "active_sessions": len(SESSIONS), "user_count": len(users), "active_users": sum(1 for user in users if user["status"] == "active")}
+
+@app.get("/admin/users")
+def admin_users(authorization: str | None = Header(default=None), search: str | None = None) -> list[dict[str, Any]]:
+    require_admin(authorization)
+    users = admin_user_rows()
+    if search:
+        needle = search.strip().lower()
+        users = [user for user in users if needle in user["email"].lower() or needle in user["name"].lower()]
+    return users
+
+@app.patch("/admin/users/{email}/status")
+def admin_update_user_status(email: str, request: AccountStatusRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_admin(authorization)
+    normalized_email = email.strip().lower()
+    if is_environment_account(normalized_email) and request.status == "suspended":
+        raise HTTPException(status_code=400, detail="Configured environment accounts cannot be suspended here; update the project secret instead")
+    with auth_db() as connection:
+        result = connection.execute("UPDATE users SET status = ? WHERE email = ?", (request.status, normalized_email))
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="User account not found")
+        connection.commit()
+    if request.status == "suspended":
+        revoke_sessions_for_email(normalized_email)
+    return {"email": normalized_email, "status": request.status}
+
+@app.get("/admin/system-status")
+def admin_system_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_admin(authorization)
+    db_exists = AUTH_DB_PATH.exists()
+    db_size = AUTH_DB_PATH.stat().st_size if db_exists else 0
+    with auth_db() as connection:
+        user_rows = connection.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+        reset_rows = connection.execute("SELECT COUNT(*) AS count FROM password_resets WHERE expires_at >= ?", (int(time.time()),)).fetchone()["count"]
+    return {
+        "service": "healthy",
+        "python": platform.python_version(),
+        "platform": platform.system(),
+        "database": {"engine": "sqlite", "path": str(AUTH_DB_PATH), "exists": db_exists, "bytes": db_size, "users": user_rows, "pending_resets": reset_rows, "writable": os.access(AUTH_DB_PATH.parent, os.W_OK)},
+        "dataset": {"path": str(DATASET_PATH), "exists": DATASET_PATH.exists(), "bytes": DATASET_PATH.stat().st_size if DATASET_PATH.exists() else 0, "stations": len(STATIONS)},
+        "sessions": {"active": len(SESSIONS), "revoked": len(REVOKED_SESSIONS)},
+        "checked_at": int(time.time()),
+    }
+
+@app.post("/admin/password")
+def admin_change_password(request: AdminPasswordRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    session = require_admin(authorization)
+    email = session["email"].lower()
+    account = next((account for account in configured_accounts().values() if account["email"].lower() == email), None)
+    if not account:
+        raise HTTPException(status_code=404, detail="Admin account not found")
+    current_matches = verify_password(request.current_password, account["password"]) if account.get("hashed") else secrets.compare_digest(account["password"], request.current_password)
+    if not current_matches:
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    with auth_db() as connection:
+        connection.execute("INSERT INTO users (email, name, password_hash, role, status, created_at) VALUES (?, ?, ?, 'admin', 'active', ?) ON CONFLICT(email) DO UPDATE SET password_hash = excluded.password_hash, role = 'admin', status = 'active'", (email, account.get("name", "Configured admin"), hash_password(request.new_password), int(time.time())))
+        connection.commit()
+    revoke_sessions_for_email(email)
+    return {"message": "Admin password updated. Sign in again with the new password."}
 
 @app.get("/admin/data-quality")
 def admin_data_quality(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    session = current_session(authorization)
-    if session["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
+    require_admin(authorization)
     missing_coordinates = sum(1 for station in STATIONS if not station.get("lat") or not station.get("lon"))
     cities = sorted({station["city"] for station in STATIONS if station.get("city")})
     return {
