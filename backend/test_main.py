@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from backend import main
-from backend.main import AccountStatusRequest, AdminPasswordRequest, DashboardSettingsRequest, LoginRequest, ProfileUpdateRequest, RecommendationRequest, STATIONS, VehicleRequest, account_profile, account_settings, account_vehicles, add_account_vehicle, admin_audit, delete_account_vehicle, network_summary, predict_wait, recommend, update_account_profile, update_account_settings
+from backend.main import AccountStatusRequest, AdminPasswordRequest, DashboardSettingsRequest, LoginRequest, ProfileUpdateRequest, RecommendationRequest, STATIONS, VehicleRequest, account_profile, account_settings, account_vehicles, add_account_vehicle, admin_audit, delete_account_vehicle, network_summary, predict_wait, recommend, telemetry_status, update_account_profile, update_account_settings
 
 
 class ChargeFlowBackendTests(unittest.TestCase):
@@ -35,6 +35,11 @@ class ChargeFlowBackendTests(unittest.TestCase):
         result = recommend(RecommendationRequest(battery_percent=80, preferred_plug="CCS", city="Gurugram", driver_lat=28.4595, driver_lon=77.0266))
         self.assertIsNotNone(result["recommendation"])
         self.assertIn("Gurugram", result["recommendation"]["city"])
+
+    def test_telemetry_falls_back_without_provider_configuration(self):
+        status = telemetry_status()
+        self.assertFalse(status["configured"])
+        self.assertEqual(status["status"], "fallback")
 
     @unittest.skipUnless(os.getenv("CHARGEFLOW_ADMIN_EMAIL") and os.getenv("CHARGEFLOW_ADMIN_PASSWORD"), "requires configured admin secrets")
     def test_admin_control_room_reports_and_controls_users(self):

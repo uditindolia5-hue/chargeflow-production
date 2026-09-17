@@ -20,6 +20,8 @@ Set the following as platform secrets or environment variables before deployment
 | `CHARGEFLOW_AUTH_DB_PATH` | A path backed by persistent storage if local registration/password recovery is enabled. |
 | `CHARGEFLOW_DATABASE_URL` | Optional `mysql://` or `mysql+pymysql://` connection for MySQL/TiDB-backed auth, settings, vehicles, profiles, and audit events. |
 | `CHARGEFLOW_SMTP_HOST` / `CHARGEFLOW_ALERT_EMAIL` | Optional SMTP alert delivery for admin activity. Add `CHARGEFLOW_SMTP_PORT`, `CHARGEFLOW_SMTP_USER`, `CHARGEFLOW_SMTP_PASSWORD`, and `CHARGEFLOW_SMTP_FROM` as needed. |
+| `CHARGEFLOW_TELEMETRY_URL` / `CHARGEFLOW_TELEMETRY_API_KEY` | Optional provider-agnostic live availability endpoint. The adapter accepts a JSON array or `{ "stations": [...] }` with `id`/`station_id`, `available_connectors`, `occupied_connectors`, `status`, and `updated_at`. |
+| `CHARGEFLOW_TELEMETRY_PROVIDER` | Optional display label for the provider, defaulting to `generic`. |
 
 Optional Google OAuth variables are documented in `.env.example` when working locally. Reset-email delivery is intentionally disabled until a real email provider is configured.
 
@@ -30,6 +32,8 @@ Administrators can open `/admin` after signing in with the configured admin acco
 The admin password form validates the current password, stores a rotated password hash in the auth database, and revokes existing admin sessions. Use the **Refresh data** control to re-read all health and user information.
 
 The profile page at `/profile` supports display-name changes, PNG/JPEG/WebP avatars up to 1 MB, per-account vehicle preferences, and multiple saved vehicles. Dashboard settings are loaded and saved against the signed-in account rather than shared browser defaults. When SMTP is configured, profile, settings, vehicle, password, and access-status events send a non-blocking alert to the configured admin recipient.
+
+Telemetry is deliberately opt-in. If the URL or API key is missing, times out, or returns an unsupported payload, station responses remain dataset-backed and the admin control room reports **Dataset fallback** rather than failing recommendations. When configured, telemetry is cached for 60 seconds and overlays connector availability/status by matching `station_id` or `id` to the packaged station identifiers.
 
 ## Local development
 

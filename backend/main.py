@@ -10,6 +10,7 @@ import sqlite3
 import time
 import smtplib
 from email.message import EmailMessage
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from math import asin, cos, radians, sin, sqrt
@@ -128,9 +129,48 @@ SESSION_TTL_SECONDS = 60 * 60 * 12
 GOOGLE_STATES: set[str] = set()
 AUTH_DB_PATH = Path(os.getenv("CHARGEFLOW_AUTH_DB_PATH", str(Path(__file__).resolve().parents[1] / "data" / "chargeflow_auth.sqlite3")))
 DATABASE_URL = os.getenv("CHARGEFLOW_DATABASE_URL", "")
+TELEMETRY_URL = os.getenv("CHARGEFLOW_TELEMETRY_URL", "").strip()
+TELEMETRY_KEY = os.getenv("CHARGEFLOW_TELEMETRY_API_KEY", "").strip()
+TELEMETRY_CACHE: dict[str, Any] = {"updated_at": 0, "status": "fallback", "records": {}}
 
 def mysql_url() -> str | None:
     return DATABASE_URL if DATABASE_URL.startswith(("mysql://", "mysql+pymysql://")) else None
+
+def telemetry_status() -> dict[str, Any]:
+    return {"configured": bool(TELEMETRY_URL and TELEMETRY_KEY), "provider": os.getenv("CHARGEFLOW_TELEMETRY_PROVIDER", "generic"), "status": TELEMETRY_CACHE["status"], "updated_at": TELEMETRY_CACHE["updated_at"], "records": len(TELEMETRY_CACHE["records"])}
+
+def refresh_telemetry(force: bool = False) -> dict[str, dict[str, Any]]:
+    if not TELEMETRY_URL or not TELEMETRY_KEY:
+        return {}
+    if not force and time.time() - float(TELEMETRY_CACHE["updated_at"]) < 60:
+        return TELEMETRY_CACHE["records"]
+    try:
+        request = UrlRequest(TELEMETRY_URL, headers={"Authorization": f"Bearer {TELEMETRY_KEY}", "Accept": "application/json"})
+        with urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read(2 * 1024 * 1024).decode("utf-8"))
+        rows = payload.get("stations", payload) if isinstance(payload, dict) else payload
+        records: dict[str, dict[str, Any]] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict): continue
+            station_id = str(row.get("station_id", row.get("id", ""))).strip()
+            if station_id:
+                records[station_id] = {key: row[key] for key in ("available_connectors", "occupied_connectors", "status", "updated_at") if key in row}
+        TELEMETRY_CACHE.update({"updated_at": time.time(), "status": "connected", "records": records})
+    except (OSError, URLError, ValueError, json.JSONDecodeError):
+        TELEMETRY_CACHE.update({"updated_at": time.time(), "status": "fallback", "records": {}})
+    return TELEMETRY_CACHE["records"]
+
+def with_telemetry(station: dict[str, Any]) -> dict[str, Any]:
+    item = dict(station)
+    record = refresh_telemetry().get(str(station["id"]))
+    if record:
+        if "available_connectors" in record: item["available_connectors"] = record["available_connectors"]
+        if "occupied_connectors" in record: item["current_occupancy"] = record["occupied_connectors"]
+        if "status" in record: item["live_status"] = record["status"]
+        item["telemetry_source"] = "live"
+    else:
+        item["telemetry_source"] = "dataset-fallback"
+    return item
 
 class MySQLCompatConnection:
     def __init__(self, connection: Any):
@@ -658,6 +698,7 @@ def admin_system_status(authorization: str | None = Header(default=None)) -> dic
         "database": {"engine": "sqlite", "path": str(AUTH_DB_PATH), "exists": db_exists, "bytes": db_size, "users": user_rows, "pending_resets": reset_rows, "writable": os.access(AUTH_DB_PATH.parent, os.W_OK)},
         "dataset": {"path": str(DATASET_PATH), "exists": DATASET_PATH.exists(), "bytes": DATASET_PATH.stat().st_size if DATASET_PATH.exists() else 0, "stations": len(STATIONS)},
         "sessions": {"active": len(SESSIONS), "revoked": len(REVOKED_SESSIONS)},
+        "telemetry": telemetry_status(),
         "checked_at": int(time.time()),
     }
 
@@ -712,11 +753,15 @@ def stations(limit: int = Query(default=50, ge=1, le=2000), city: str | None = N
     filtered = STATIONS
     if city:
         filtered = [station for station in STATIONS if city.lower() in station["city"].lower()]
-    return filtered[:limit]
+    return [with_telemetry(station) for station in filtered[:limit]]
+
+@app.get("/telemetry/status")
+def public_telemetry_status() -> dict[str, Any]:
+    return telemetry_status()
 
 @app.get("/network/summary")
 def network_summary(city: str | None = None) -> dict[str, Any]:
-    filtered = [station for station in STATIONS if not city or city.lower() in station["city"].lower()]
+    filtered = [with_telemetry(station) for station in STATIONS if not city or city.lower() in station["city"].lower()]
     if not filtered:
         return {"station_count": 0, "open_connectors": 0, "total_connectors": 0, "average_wait": 0, "low_wait_count": 0, "average_price": 0, "updated_at": int(time.time())}
     open_connectors = sum(max(0, int(station["num_plugs"]) - int(station["current_occupancy"])) for station in filtered)
@@ -738,7 +783,7 @@ def predict(request: PredictionRequest) -> dict[str, Any]:
 
 @app.post("/recommend")
 def recommend(request: RecommendationRequest) -> dict[str, Any]:
-    compatible = [station for station in STATIONS if request.preferred_plug.upper() in station["plug_types"]]
+    compatible = [with_telemetry(station) for station in STATIONS if request.preferred_plug.upper() in station["plug_types"]]
     if request.city:
         city_matches = [station for station in compatible if request.city.lower() in station["city"].lower()]
         if city_matches:
