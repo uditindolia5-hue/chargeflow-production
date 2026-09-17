@@ -88,7 +88,7 @@ const stations: Station[] = [
 ];
 
 const initialTrace: TraceItem[] = [
-  { tool: "get_driver_battery_status", detail: "local driver session", result: "18% battery · 74 km estimated range", status: "complete" },
+  { tool: "get_driver_battery_status", detail: "authenticated driver session", result: "18% battery · 74 km estimated range", status: "complete" },
   { tool: "calculate_route_distance", detail: "New Delhi → nearby India stations", result: "Distances calculated from station coordinates", status: "complete" },
   { tool: "predict_station_wait_time", detail: "India dataset candidates", result: "Wait estimates calculated per compatible station", status: "complete" },
   { tool: "recommendation_guardrail", detail: "reachability + plug compatibility", result: "India station selected by total stop time", status: "complete" },
@@ -137,6 +137,8 @@ function TraceRow({ item, index }: { item: TraceItem; index: number }) {
 
 export default function Home() {
   const [, navigate] = useLocation();
+  const session = getSession();
+  const accountLabel = session?.email ?? "Signed-in driver";
   const [selectedId, setSelectedId] = useState("IN-0001");
   const [battery, setBattery] = useState(() => Number(localStorage.getItem("chargeflow-battery") ?? 18));
   const [vehicleName, setVehicleName] = useState(() => localStorage.getItem("chargeflow-vehicle") ?? "Polestar 2 Long Range");
@@ -166,9 +168,7 @@ export default function Home() {
   const [lastRefresh, setLastRefresh] = useState(() => new Date());
   const [networkSummary, setNetworkSummary] = useState<NetworkSummary | null>(null);
   const [chatMessages, setChatMessages] = useState([
-    { from: "agent", text: "I’m watching Indian stations within range. Tell me where you are and what matters most right now.", time: "09:41" },
-    { from: "user", text: "I’m near Connaught Place, at 18%. I need a CCS charger and don’t want to wait too long.", time: "09:42" },
-    { from: "agent", text: "I found the quickest total stop: IOCL Rajokri Station. It’s 7 minutes away with a predicted 4 minute wait, and 4 CCS-compatible plugs are open.", time: "09:42" },
+    { from: "agent", text: "I’m watching Indian stations within range. Tell me where you are and what matters most right now.", time: "now" },
   ]);
 
   const selectedStation = useMemo(() => networkStations.find((station) => station.id === selectedId) ?? networkStations[0], [networkStations, selectedId]);
@@ -313,10 +313,10 @@ export default function Home() {
           <button className="nav-link" onClick={() => showNotice(`Python API status: ${pythonStatus}. Recommendations are dataset-backed.`)}><Gauge size={15} /> Model health</button>
         </nav>
         <div className="top-actions">
-          <div className="live-chip"><span className="live-dot" /> Demo network live</div>
+          <div className="live-chip"><span className="live-dot" /> Network live</div>
           <button className="icon-button" onClick={() => showNotice("ChargeFlow recommends reachable stations, predicts wait time, and explains each choice.")} aria-label="Help"><CircleHelp size={18} /></button>
           <button className="icon-button" onClick={() => setSettingsOpen((open) => !open)} aria-label="Settings"><Settings2 size={18} /></button>
-          <button className="avatar" aria-label="Sign out" onClick={() => void logout}>IN</button>
+          <button className="avatar" aria-label={`Sign out ${accountLabel}`} onClick={() => void logout}>{accountLabel.slice(0, 2).toUpperCase()}</button>
           <button className="menu-button" onClick={() => setMobileNav((open) => !open)} aria-label="Toggle navigation">{mobileNav ? <X size={20} /> : <Menu size={20} />}</button>
         </div>
       </header>
@@ -326,7 +326,7 @@ export default function Home() {
       <div className="workspace">
         <aside className="sidebar">
           <div className="sidebar-heading">
-            <div><div className="eyebrow">Driver profile</div><h2>Local driver</h2></div>
+            <div><div className="eyebrow">Signed-in account</div><h2>{accountLabel}</h2></div>
             <button className="edit-button" onClick={() => setSettingsOpen(true)}>Edit</button>
           </div>
           <div className="driver-card">
@@ -349,7 +349,7 @@ export default function Home() {
             <input className="battery-slider" type="range" min="10" max="90" value={battery} onChange={(event) => setBattery(Number(event.target.value))} />
             <p>Adjust charge to test reachability and recommendation logic.</p>
           </div>
-          <div className="sidebar-bottom"><div className="system-note"><ShieldCheck size={15} /><span>All recommendations pass reachability checks.</span></div><div className="sidebar-version">CHARGEFLOW / PROTOTYPE 0.1</div></div>
+          <div className="sidebar-bottom"><div className="system-note"><ShieldCheck size={15} /><span>All recommendations pass reachability checks.</span></div><div className="sidebar-version">CHARGEFLOW / INDIA NETWORK</div></div>
         </aside>
 
         <main className="main-content">
