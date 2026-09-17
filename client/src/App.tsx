@@ -1,16 +1,33 @@
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useEffect } from "react";
 import NotFound from "@/pages/NotFound";
-import { Route, Switch } from "wouter";
+import Admin from "@/pages/Admin";
+import Login from "@/pages/Login";
+import PasswordReset from "@/pages/PasswordReset";
+import { Route, Switch, useLocation } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import Home from "./pages/Home";
+import { getSession } from "@/lib/auth";
+
+function ProtectedHome() {
+  const [, navigate] = useLocation();
+  const session = getSession();
+  useEffect(() => {
+    if (!session) navigate("/login");
+  }, [navigate, session]);
+  return session ? <Home /> : null;
+}
 
 function Router() {
   // make sure to consider if you need authentication for certain routes
   return (
     <Switch>
-      <Route path={"/"} component={Home} />
+      <Route path="/login" component={Login} />
+      <Route path="/reset-password" component={PasswordReset} />
+      <Route path="/admin" component={Admin} />
+      <Route path="/" component={ProtectedHome} />
       <Route path={"/404"} component={NotFound} />
       {/* Final fallback route */}
       <Route component={NotFound} />

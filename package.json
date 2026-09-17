@@ -1,5 +1,5 @@
 {
-  "name": "chargeflow-production",
+  "name": "chargeflow-permanent",
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
@@ -10,6 +10,7 @@
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "test": "vitest run",
+    "test:backend": "python3 -m unittest discover -s backend -p 'test_*.py'",
     "db:push": "drizzle-kit generate && drizzle-kit migrate"
   },
   "dependencies": {
