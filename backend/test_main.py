@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from backend import main
-from backend.main import AccountStatusRequest, AdminPasswordRequest, DashboardSettingsRequest, LoginRequest, ProfileUpdateRequest, RecommendationRequest, STATIONS, account_profile, account_settings, admin_audit, network_summary, predict_wait, recommend, update_account_profile, update_account_settings
+from backend.main import AccountStatusRequest, AdminPasswordRequest, DashboardSettingsRequest, LoginRequest, ProfileUpdateRequest, RecommendationRequest, STATIONS, VehicleRequest, account_profile, account_settings, account_vehicles, add_account_vehicle, admin_audit, delete_account_vehicle, network_summary, predict_wait, recommend, update_account_profile, update_account_settings
 
 
 class ChargeFlowBackendTests(unittest.TestCase):
@@ -69,6 +69,9 @@ class ChargeFlowBackendTests(unittest.TestCase):
             settings = update_account_settings(DashboardSettingsRequest(vehicle_name="Test EV", preferred_plug="Type 2", battery_percent=44, city="Mumbai"), authorization)
             self.assertEqual(account_settings(authorization)["city"], "Mumbai")
             self.assertEqual(account_profile(authorization)["display_name"], "Control Room Admin")
+            vehicle = add_account_vehicle(VehicleRequest(name="Roadster Test", preferred_plug="CCS", battery_percent=55), authorization)
+            self.assertTrue(any(item["id"] == vehicle["id"] for item in account_vehicles(authorization)))
+            self.assertEqual(delete_account_vehicle(int(vehicle["id"]), authorization), {"success": True})
             self.assertTrue(any(event["action"] == "settings.updated" for event in admin_audit(authorization=authorization)))
         main.AUTH_DB_PATH = original_db_path
         main.SESSIONS.clear(); main.SESSIONS.update(original_sessions)

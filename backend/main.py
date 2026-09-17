@@ -8,13 +8,15 @@ import hmac
 import platform
 import sqlite3
 import time
+import smtplib
+from email.message import EmailMessage
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -112,6 +114,12 @@ class DashboardSettingsRequest(BaseModel):
     battery_percent: int = Field(ge=10, le=100)
     city: Literal["New Delhi", "Gurugram", "Bengaluru", "Mumbai"]
 
+class VehicleRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    preferred_plug: Literal["CCS", "Type 2", "NACS"]
+    battery_percent: int = Field(ge=10, le=100)
+
+
 
 SESSIONS: dict[str, dict[str, str]] = {}
 REVOKED_SESSIONS: set[str] = set()
@@ -119,35 +127,122 @@ SESSION_SECRET = (SESSION_SECRET_VALUE or "local-development-session-secret").en
 SESSION_TTL_SECONDS = 60 * 60 * 12
 GOOGLE_STATES: set[str] = set()
 AUTH_DB_PATH = Path(os.getenv("CHARGEFLOW_AUTH_DB_PATH", str(Path(__file__).resolve().parents[1] / "data" / "chargeflow_auth.sqlite3")))
+DATABASE_URL = os.getenv("CHARGEFLOW_DATABASE_URL", "")
+
+def mysql_url() -> str | None:
+    return DATABASE_URL if DATABASE_URL.startswith(("mysql://", "mysql+pymysql://")) else None
+
+class MySQLCompatConnection:
+    def __init__(self, connection: Any):
+        self.connection = connection
+        self.cursor = connection.cursor()
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        sql = sql.replace("?", "%s")
+        sql = sql.replace("ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name, updated_at = excluded.updated_at", "ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), updated_at = VALUES(updated_at)")
+        sql = sql.replace("ON CONFLICT(email) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at", "ON DUPLICATE KEY UPDATE settings_json = VALUES(settings_json), updated_at = VALUES(updated_at)")
+        sql = sql.replace("ON CONFLICT(email) DO UPDATE SET avatar_data = excluded.avatar_data, avatar_mime = excluded.avatar_mime, updated_at = excluded.updated_at", "ON DUPLICATE KEY UPDATE avatar_data = VALUES(avatar_data), avatar_mime = VALUES(avatar_mime), updated_at = VALUES(updated_at)")
+        sql = sql.replace("ON CONFLICT(email) DO UPDATE SET password_hash = excluded.password_hash, role = 'admin', status = 'active'", "ON DUPLICATE KEY UPDATE password_hash = VALUES(password_hash), role = 'admin', status = 'active'")
+        self.cursor.execute(sql, params)
+        return self.cursor
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.cursor.close(); self.connection.close()
+
+    def __enter__(self) -> "MySQLCompatConnection":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if exc_type: self.connection.rollback()
+        self.close()
 
 def auth_db() -> sqlite3.Connection:
+    url = mysql_url()
+    if url:
+        try:
+            import pymysql
+            from urllib.parse import urlparse
+            parsed = urlparse(url.replace("mysql+pymysql://", "mysql://", 1))
+            connection = pymysql.connect(host=parsed.hostname or "localhost", port=parsed.port or 3306, user=parsed.username, password=parsed.password, database=(parsed.path or "/").lstrip("/") or None, cursorclass=pymysql.cursors.DictCursor, autocommit=False)
+            cursor = connection.cursor()
+            cursor.execute("CREATE TABLE IF NOT EXISTS users (email VARCHAR(320) PRIMARY KEY, name VARCHAR(120) NOT NULL, password_hash TEXT NOT NULL, role VARCHAR(20) NOT NULL DEFAULT 'user', status VARCHAR(20) NOT NULL DEFAULT 'active', created_at BIGINT NOT NULL)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS password_resets (token VARCHAR(200) PRIMARY KEY, email VARCHAR(320) NOT NULL, expires_at BIGINT NOT NULL)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS profiles (email VARCHAR(320) PRIMARY KEY, display_name VARCHAR(120) NOT NULL, avatar_data LONGTEXT NULL, avatar_mime VARCHAR(80) NULL, updated_at BIGINT NOT NULL)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS user_settings (email VARCHAR(320) PRIMARY KEY, settings_json TEXT NOT NULL, updated_at BIGINT NOT NULL)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS user_vehicles (id BIGINT PRIMARY KEY AUTO_INCREMENT, email VARCHAR(320) NOT NULL, name VARCHAR(120) NOT NULL, preferred_plug VARCHAR(24) NOT NULL, battery_percent INT NOT NULL, created_at BIGINT NOT NULL)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS audit_events (id BIGINT PRIMARY KEY AUTO_INCREMENT, actor_email VARCHAR(320) NOT NULL, action VARCHAR(120) NOT NULL, target_email VARCHAR(320) NULL, details TEXT NOT NULL, created_at BIGINT NOT NULL)")
+            connection.commit()
+            return MySQLCompatConnection(connection)
+        except ImportError as error:
+            raise RuntimeError("MySQL/TiDB is configured but pymysql is not installed") from error
     AUTH_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(AUTH_DB_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute("CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS password_resets (token TEXT PRIMARY KEY, email TEXT NOT NULL, expires_at INTEGER NOT NULL)")
-    connection.execute("CREATE TABLE IF NOT EXISTS profiles (email TEXT PRIMARY KEY, display_name TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS profiles (email TEXT PRIMARY KEY, display_name TEXT NOT NULL, avatar_data TEXT, avatar_mime TEXT, updated_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS user_settings (email TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS user_vehicles (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, name TEXT NOT NULL, preferred_plug TEXT NOT NULL, battery_percent INTEGER NOT NULL, created_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_email TEXT NOT NULL, action TEXT NOT NULL, target_email TEXT, details TEXT NOT NULL, created_at INTEGER NOT NULL)")
     try:
         connection.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
     except sqlite3.OperationalError:
         pass
+    for column, definition in (("avatar_data", "TEXT"), ("avatar_mime", "TEXT")):
+        try:
+            connection.execute(f"ALTER TABLE profiles ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            pass
     connection.commit()
     return connection
 
+def db_execute(connection: Any, sql: str, params: tuple[Any, ...] = ()) -> Any:
+    if mysql_url():
+        sql = sql.replace("?", "%s")
+    return connection.execute(sql, params)
+
 def record_audit(actor_email: str, action: str, target_email: str | None = None, details: dict[str, Any] | None = None) -> None:
+    payload = details or {}
     with auth_db() as connection:
-        connection.execute("INSERT INTO audit_events (actor_email, action, target_email, details, created_at) VALUES (?, ?, ?, ?, ?)", (actor_email.lower(), action, target_email.lower() if target_email else None, json.dumps(details or {}, separators=(",", ":")), int(time.time())))
+        connection.execute("INSERT INTO audit_events (actor_email, action, target_email, details, created_at) VALUES (?, ?, ?, ?, ?)", (actor_email.lower(), action, target_email.lower() if target_email else None, json.dumps(payload, separators=(",", ":")), int(time.time())))
         connection.commit()
+    notify_admin_action(actor_email, action, target_email, payload)
+
+def notify_admin_action(actor_email: str, action: str, target_email: str | None, details: dict[str, Any]) -> None:
+    host = os.getenv("CHARGEFLOW_SMTP_HOST", "").strip()
+    recipient = os.getenv("CHARGEFLOW_ALERT_EMAIL", "").strip()
+    if not host or not recipient:
+        return
+    message = EmailMessage()
+    message["Subject"] = f"ChargeFlow admin activity: {action}"
+    message["From"] = os.getenv("CHARGEFLOW_SMTP_FROM", os.getenv("CHARGEFLOW_SMTP_USER", recipient))
+    message["To"] = recipient
+    message.set_content(f"Actor: {actor_email}\nAction: {action}\nTarget: {target_email or '—'}\nDetails: {json.dumps(details, indent=2)}")
+    try:
+        port = int(os.getenv("CHARGEFLOW_SMTP_PORT", "587"))
+        with smtplib.SMTP(host, port, timeout=8) as smtp:
+            smtp.starttls()
+            username = os.getenv("CHARGEFLOW_SMTP_USER", "")
+            password = os.getenv("CHARGEFLOW_SMTP_PASSWORD", "")
+            if username and password: smtp.login(username, password)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException):
+        # Notifications must never make an otherwise successful admin action fail.
+        return
 
 def default_settings() -> dict[str, Any]:
     return {"vehicle_name": "Polestar 2 Long Range", "preferred_plug": "CCS", "battery_percent": 18, "city": "New Delhi"}
 
-def get_profile(email: str, fallback_name: str = "") -> dict[str, str]:
+def get_profile(email: str, fallback_name: str = "") -> dict[str, Any]:
     with auth_db() as connection:
-        row = connection.execute("SELECT display_name FROM profiles WHERE email = ?", (email.lower(),)).fetchone()
-    return {"email": email.lower(), "display_name": row["display_name"] if row else (fallback_name or email.lower())}
+        row = connection.execute("SELECT display_name, avatar_data, avatar_mime FROM profiles WHERE email = ?", (email.lower(),)).fetchone()
+    avatar_url = None
+    if row and row["avatar_data"] and row["avatar_mime"]:
+        avatar_url = f"data:{row['avatar_mime']};base64,{row['avatar_data']}"
+    return {"email": email.lower(), "display_name": row["display_name"] if row else (fallback_name or email.lower()), "avatar_url": avatar_url}
 
 def get_settings(email: str) -> dict[str, Any]:
     with auth_db() as connection:
@@ -432,12 +527,12 @@ def me(authorization: str | None = Header(default=None)) -> dict[str, str]:
     return current_session(authorization)
 
 @app.get("/account/profile")
-def account_profile(authorization: str | None = Header(default=None)) -> dict[str, str]:
+def account_profile(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     session = current_session(authorization)
     return get_profile(session["email"], session.get("name", ""))
 
 @app.put("/account/profile")
-def update_account_profile(request: ProfileUpdateRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
+def update_account_profile(request: ProfileUpdateRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     session = current_session(authorization)
     email = session["email"].lower()
     with auth_db() as connection:
@@ -446,6 +541,22 @@ def update_account_profile(request: ProfileUpdateRequest, authorization: str | N
     session["name"] = request.display_name.strip()
     record_audit(email, "profile.updated", email, {"display_name": request.display_name.strip()})
     return get_profile(email, request.display_name.strip())
+
+@app.put("/account/avatar")
+def update_account_avatar(file: UploadFile = File(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    session = current_session(authorization)
+    if file.content_type not in {"image/png", "image/jpeg", "image/webp"}:
+        raise HTTPException(status_code=415, detail="Upload a PNG, JPEG, or WebP image")
+    content = file.file.read(1024 * 1024 + 1)
+    if len(content) > 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Avatar must be 1 MB or smaller")
+    encoded = base64.b64encode(content).decode("ascii")
+    email = session["email"].lower()
+    with auth_db() as connection:
+        connection.execute("INSERT INTO profiles (email, display_name, avatar_data, avatar_mime, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET avatar_data = excluded.avatar_data, avatar_mime = excluded.avatar_mime, updated_at = excluded.updated_at", (email, session.get("name", email), encoded, file.content_type, int(time.time())))
+        connection.commit()
+    record_audit(email, "profile.avatar_updated", email, {"mime": file.content_type})
+    return get_profile(email, session.get("name", email))
 
 @app.get("/account/settings")
 def account_settings(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -462,6 +573,36 @@ def update_account_settings(request: DashboardSettingsRequest, authorization: st
         connection.commit()
     record_audit(email, "settings.updated", email, settings)
     return settings
+
+@app.get("/account/vehicles")
+def account_vehicles(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    session = current_session(authorization)
+    with auth_db() as connection:
+        rows = connection.execute("SELECT id, name, preferred_plug, battery_percent, created_at FROM user_vehicles WHERE email = ? ORDER BY created_at DESC", (session["email"].lower(),)).fetchall()
+    return [dict(row) for row in rows]
+
+@app.post("/account/vehicles")
+def add_account_vehicle(request: VehicleRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    session = current_session(authorization)
+    email = session["email"].lower()
+    with auth_db() as connection:
+        cursor = connection.execute("INSERT INTO user_vehicles (email, name, preferred_plug, battery_percent, created_at) VALUES (?, ?, ?, ?, ?)", (email, request.name.strip(), request.preferred_plug, request.battery_percent, int(time.time())))
+        connection.commit()
+        vehicle_id = cursor.lastrowid
+    record_audit(email, "vehicle.added", email, {"name": request.name.strip()})
+    return {"id": vehicle_id, "name": request.name.strip(), "preferred_plug": request.preferred_plug, "battery_percent": request.battery_percent}
+
+@app.delete("/account/vehicles/{vehicle_id}")
+def delete_account_vehicle(vehicle_id: int, authorization: str | None = Header(default=None)) -> dict[str, bool]:
+    session = current_session(authorization)
+    email = session["email"].lower()
+    with auth_db() as connection:
+        result = connection.execute("DELETE FROM user_vehicles WHERE id = ? AND email = ?", (vehicle_id, email))
+        connection.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    record_audit(email, "vehicle.deleted", email, {"vehicle_id": vehicle_id})
+    return {"success": True}
 
 @app.post("/auth/logout")
 def logout(authorization: str | None = Header(default=None)) -> dict[str, bool]:

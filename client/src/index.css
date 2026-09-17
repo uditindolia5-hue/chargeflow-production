@@ -301,3 +301,23 @@ h1, h2, h3, p { margin: 0; }
 .audit-row span, .audit-row time { color:#809088; font-size:11px; margin-top:4px; }
 .audit-row time { white-space:nowrap; }
 @media (max-width: 700px) { .profile-content { padding:40px 18px 64px; } .profile-grid { grid-template-columns:1fr; } .profile-actions { grid-column:auto; } .audit-row { grid-template-columns:30px 1fr; } .audit-row time { grid-column:2; } }
+
+.avatar-upload { position:relative; display:inline-flex; flex-direction:column; align-items:flex-start; gap:8px; margin-bottom:24px; color:#b9f2d8; font-size:11px; text-transform:uppercase; letter-spacing:.08em; cursor:pointer; }
+.avatar-upload input { position:absolute; width:1px; height:1px; opacity:0; }
+.avatar-upload img, .avatar-upload .profile-icon { width:64px; height:64px; object-fit:cover; border-radius:18px; border:2px solid #a3eed0; }
+.avatar-upload span { text-decoration:underline; text-underline-offset:3px; }
+
+.profile-vehicles { grid-column:1/-1; }
+.muted-copy { color:#788980; }
+.vehicle-list { display:grid; gap:10px; margin-bottom:18px; }
+.vehicle-item { display:flex; justify-content:space-between; align-items:center; gap:14px; padding:12px 14px; border:1px solid #e1e9e3; border-radius:12px; background:#fbfdfb; }
+.vehicle-item strong, .vehicle-item span { display:block; }
+.vehicle-item span { margin-top:4px; color:#788980; font-size:12px; }
+.vehicle-item button { border:0; background:transparent; color:#ba5d53; cursor:pointer; font-size:12px; }
+.vehicle-add { display:grid; grid-template-columns:1fr 130px auto; gap:8px; }
+.vehicle-add input, .vehicle-add select { min-height:40px; border:1px solid #d8e2db; border-radius:9px; padding:8px 10px; background:#fff; }
+.vehicle-add button { border:0; border-radius:9px; padding:0 15px; background:#15352a; color:#fff; cursor:pointer; }
+@media (max-width:700px) { .profile-vehicles { grid-column:auto; } .vehicle-add { grid-template-columns:1fr 1fr; } .vehicle-add button { min-height:40px; grid-column:1/-1; } }
+
+.vehicle-actions { display:flex; gap:10px; }
+.vehicle-actions button:first-child { color:#258d6e; font-weight:600; }
