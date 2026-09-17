@@ -5,6 +5,7 @@ import NotFound from "@/pages/NotFound";
 import Admin from "@/pages/Admin";
 import Login from "@/pages/Login";
 import PasswordReset from "@/pages/PasswordReset";
+import Profile from "@/pages/Profile";
 import { Route, Switch, useLocation } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
@@ -26,6 +27,7 @@ function Router() {
     <Switch>
       <Route path="/login" component={Login} />
       <Route path="/reset-password" component={PasswordReset} />
+      <Route path="/profile" component={Profile} />
       <Route path="/admin" component={Admin} />
       <Route path="/" component={ProtectedHome} />
       <Route path={"/404"} component={NotFound} />

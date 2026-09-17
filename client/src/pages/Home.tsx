@@ -138,14 +138,14 @@ function TraceRow({ item, index }: { item: TraceItem; index: number }) {
 export default function Home() {
   const [, navigate] = useLocation();
   const session = getSession();
+  const sessionToken = session?.token;
   const accountLabel = session?.email ?? "Signed-in driver";
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [selectedId, setSelectedId] = useState("IN-0001");
-  const [battery, setBattery] = useState(() => Number(localStorage.getItem("chargeflow-battery") ?? 18));
-  const [vehicleName, setVehicleName] = useState(() => localStorage.getItem("chargeflow-vehicle") ?? "Polestar 2 Long Range");
-  const [preferredPlug, setPreferredPlug] = useState(() => localStorage.getItem("chargeflow-plug") ?? "CCS");
-  const [locationContext, setLocationContext] = useState<LocationContext>(() => {
-    try { return JSON.parse(localStorage.getItem("chargeflow-location") ?? "") as LocationContext; } catch { return LOCATION_PRESETS[0]; }
-  });
+  const [battery, setBattery] = useState(18);
+  const [vehicleName, setVehicleName] = useState("Polestar 2 Long Range");
+  const [preferredPlug, setPreferredPlug] = useState("CCS");
+  const [locationContext, setLocationContext] = useState<LocationContext>(LOCATION_PRESETS[0]);
   const [message, setMessage] = useState("");
   const [mobileNav, setMobileNav] = useState(false);
   const [traceOpen, setTraceOpen] = useState(true);
@@ -198,10 +198,24 @@ export default function Home() {
     navigate("/login");
   };
 
-  useEffect(() => { localStorage.setItem("chargeflow-battery", String(battery)); }, [battery]);
-  useEffect(() => { localStorage.setItem("chargeflow-vehicle", vehicleName); }, [vehicleName]);
-  useEffect(() => { localStorage.setItem("chargeflow-plug", preferredPlug); }, [preferredPlug]);
-  useEffect(() => { localStorage.setItem("chargeflow-location", JSON.stringify(locationContext)); }, [locationContext]);
+  useEffect(() => {
+    if (!sessionToken) return;
+    void fetch(`${PYTHON_API_BASE}/account/settings`, { headers: { Authorization: `Bearer ${sessionToken}` } })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("Unable to load account settings")))
+      .then((settings: { vehicle_name: string; preferred_plug: string; battery_percent: number; city: string }) => {
+        setVehicleName(settings.vehicle_name); setPreferredPlug(settings.preferred_plug); setBattery(settings.battery_percent);
+        const preset = LOCATION_PRESETS.find((item) => item.city === settings.city); if (preset) setLocationContext(preset);
+      }).catch(() => showNotice("Using default dashboard settings while your profile loads."))
+      .finally(() => setSettingsLoaded(true));
+  }, [sessionToken]);
+
+  useEffect(() => {
+    if (!sessionToken || !settingsLoaded) return;
+    const timer = window.setTimeout(() => {
+      void fetch(`${PYTHON_API_BASE}/account/settings`, { method: "PUT", headers: { Authorization: `Bearer ${sessionToken}`, "Content-Type": "application/json" }, body: JSON.stringify({ vehicle_name: vehicleName, preferred_plug: preferredPlug, battery_percent: battery, city: locationContext.city }) });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [battery, locationContext, preferredPlug, sessionToken, settingsLoaded, vehicleName]);
 
   useEffect(() => {
     const loadPythonRecommendation = async () => {
@@ -316,13 +330,13 @@ export default function Home() {
           <div className="live-chip"><span className="live-dot" /> Network live</div>
           <button className="icon-button" onClick={() => showNotice("ChargeFlow recommends reachable stations, predicts wait time, and explains each choice.")} aria-label="Help"><CircleHelp size={18} /></button>
           <button className="icon-button" onClick={() => setSettingsOpen((open) => !open)} aria-label="Settings"><Settings2 size={18} /></button>
-          <button className="avatar" aria-label={`Sign out ${accountLabel}`} onClick={() => void logout}>{accountLabel.slice(0, 2).toUpperCase()}</button>
+          <button className="avatar" aria-label={`Open profile for ${accountLabel}`} onClick={() => navigate("/profile")}>{accountLabel.slice(0, 2).toUpperCase()}</button>
           <button className="menu-button" onClick={() => setMobileNav((open) => !open)} aria-label="Toggle navigation">{mobileNav ? <X size={20} /> : <Menu size={20} />}</button>
         </div>
       </header>
 
       {notice && <div className="app-notice" role="status">{notice}</div>}
-      {settingsOpen && <div className="settings-popover"><div className="eyebrow">Driver settings</div><label>Vehicle name<input value={vehicleName} onChange={(event) => setVehicleName(event.target.value)} /></label><label>Preferred plug<select value={preferredPlug} onChange={(event) => setPreferredPlug(event.target.value)}><option value="CCS">CCS</option><option value="Type 2">Type 2</option><option value="NACS">NACS</option></select></label><button onClick={() => { setSettingsOpen(false); showNotice("Driver settings saved."); }}>Save settings</button></div>}
+      {settingsOpen && <div className="settings-popover"><div className="eyebrow">Dashboard settings</div><label>Vehicle name<input value={vehicleName} onChange={(event) => setVehicleName(event.target.value)} /></label><label>Preferred plug<select value={preferredPlug} onChange={(event) => setPreferredPlug(event.target.value)}><option value="CCS">CCS</option><option value="Type 2">Type 2</option><option value="NACS">NACS</option></select></label><button onClick={() => { setSettingsOpen(false); showNotice("Dashboard settings saved to your account."); }}>Save settings</button><button className="secondary" onClick={() => navigate("/profile")}>Open profile</button></div>}
       <div className="workspace">
         <aside className="sidebar">
           <div className="sidebar-heading">

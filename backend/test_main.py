@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from backend import main
-from backend.main import AccountStatusRequest, AdminPasswordRequest, LoginRequest, RecommendationRequest, STATIONS, network_summary, predict_wait, recommend
+from backend.main import AccountStatusRequest, AdminPasswordRequest, DashboardSettingsRequest, LoginRequest, ProfileUpdateRequest, RecommendationRequest, STATIONS, account_profile, account_settings, admin_audit, network_summary, predict_wait, recommend, update_account_profile, update_account_settings
 
 
 class ChargeFlowBackendTests(unittest.TestCase):
@@ -63,6 +63,13 @@ class ChargeFlowBackendTests(unittest.TestCase):
             self.assertIn("updated", changed["message"])
             rotated_login = main.login(LoginRequest(email=os.environ["CHARGEFLOW_ADMIN_EMAIL"], password="AnotherPassword123"))
             self.assertEqual(rotated_login["role"], "admin")
+            authorization = f"Bearer {rotated_login['token']}"
+            profile = update_account_profile(ProfileUpdateRequest(display_name="Control Room Admin"), authorization)
+            self.assertEqual(profile["display_name"], "Control Room Admin")
+            settings = update_account_settings(DashboardSettingsRequest(vehicle_name="Test EV", preferred_plug="Type 2", battery_percent=44, city="Mumbai"), authorization)
+            self.assertEqual(account_settings(authorization)["city"], "Mumbai")
+            self.assertEqual(account_profile(authorization)["display_name"], "Control Room Admin")
+            self.assertTrue(any(event["action"] == "settings.updated" for event in admin_audit(authorization=authorization)))
         main.AUTH_DB_PATH = original_db_path
         main.SESSIONS.clear(); main.SESSIONS.update(original_sessions)
         main.REVOKED_SESSIONS.clear(); main.REVOKED_SESSIONS.update(original_revoked)

@@ -103,6 +103,16 @@ class AdminPasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=200)
     new_password: str = Field(min_length=8, max_length=200)
 
+class ProfileUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=2, max_length=120)
+
+class DashboardSettingsRequest(BaseModel):
+    vehicle_name: str = Field(min_length=2, max_length=120)
+    preferred_plug: Literal["CCS", "Type 2", "NACS"]
+    battery_percent: int = Field(ge=10, le=100)
+    city: Literal["New Delhi", "Gurugram", "Bengaluru", "Mumbai"]
+
+
 SESSIONS: dict[str, dict[str, str]] = {}
 REVOKED_SESSIONS: set[str] = set()
 SESSION_SECRET = (SESSION_SECRET_VALUE or "local-development-session-secret").encode()
@@ -116,12 +126,38 @@ def auth_db() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS password_resets (token TEXT PRIMARY KEY, email TEXT NOT NULL, expires_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS profiles (email TEXT PRIMARY KEY, display_name TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS user_settings (email TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, actor_email TEXT NOT NULL, action TEXT NOT NULL, target_email TEXT, details TEXT NOT NULL, created_at INTEGER NOT NULL)")
     try:
         connection.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
     except sqlite3.OperationalError:
         pass
     connection.commit()
     return connection
+
+def record_audit(actor_email: str, action: str, target_email: str | None = None, details: dict[str, Any] | None = None) -> None:
+    with auth_db() as connection:
+        connection.execute("INSERT INTO audit_events (actor_email, action, target_email, details, created_at) VALUES (?, ?, ?, ?, ?)", (actor_email.lower(), action, target_email.lower() if target_email else None, json.dumps(details or {}, separators=(",", ":")), int(time.time())))
+        connection.commit()
+
+def default_settings() -> dict[str, Any]:
+    return {"vehicle_name": "Polestar 2 Long Range", "preferred_plug": "CCS", "battery_percent": 18, "city": "New Delhi"}
+
+def get_profile(email: str, fallback_name: str = "") -> dict[str, str]:
+    with auth_db() as connection:
+        row = connection.execute("SELECT display_name FROM profiles WHERE email = ?", (email.lower(),)).fetchone()
+    return {"email": email.lower(), "display_name": row["display_name"] if row else (fallback_name or email.lower())}
+
+def get_settings(email: str) -> dict[str, Any]:
+    with auth_db() as connection:
+        row = connection.execute("SELECT settings_json FROM user_settings WHERE email = ?", (email.lower(),)).fetchone()
+    if not row:
+        return default_settings()
+    try:
+        return {**default_settings(), **json.loads(row["settings_json"])}
+    except json.JSONDecodeError:
+        return default_settings()
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
     salt = salt or os.urandom(16)
@@ -160,6 +196,7 @@ def create_session(email: str, role: str, name: str = "") -> str:
     encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
     signature = hmac.new(SESSION_SECRET, encoded.encode(), hashlib.sha256).hexdigest()
     token = f"{encoded}.{signature}"
+    REVOKED_SESSIONS.discard(token)
     SESSIONS[token] = {"email": email, "role": role, "name": name}
     return token
 
@@ -394,6 +431,38 @@ def google_callback(code: str, state: str):
 def me(authorization: str | None = Header(default=None)) -> dict[str, str]:
     return current_session(authorization)
 
+@app.get("/account/profile")
+def account_profile(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    session = current_session(authorization)
+    return get_profile(session["email"], session.get("name", ""))
+
+@app.put("/account/profile")
+def update_account_profile(request: ProfileUpdateRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    session = current_session(authorization)
+    email = session["email"].lower()
+    with auth_db() as connection:
+        connection.execute("INSERT INTO profiles (email, display_name, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name, updated_at = excluded.updated_at", (email, request.display_name.strip(), int(time.time())))
+        connection.commit()
+    session["name"] = request.display_name.strip()
+    record_audit(email, "profile.updated", email, {"display_name": request.display_name.strip()})
+    return get_profile(email, request.display_name.strip())
+
+@app.get("/account/settings")
+def account_settings(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    session = current_session(authorization)
+    return get_settings(session["email"])
+
+@app.put("/account/settings")
+def update_account_settings(request: DashboardSettingsRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    session = current_session(authorization)
+    email = session["email"].lower()
+    settings = request.model_dump()
+    with auth_db() as connection:
+        connection.execute("INSERT INTO user_settings (email, settings_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at", (email, json.dumps(settings, separators=(",", ":")), int(time.time())))
+        connection.commit()
+    record_audit(email, "settings.updated", email, settings)
+    return settings
+
 @app.post("/auth/logout")
 def logout(authorization: str | None = Header(default=None)) -> dict[str, bool]:
     token = (authorization or "").removeprefix("Bearer ").strip()
@@ -419,7 +488,7 @@ def admin_users(authorization: str | None = Header(default=None), search: str | 
 
 @app.patch("/admin/users/{email}/status")
 def admin_update_user_status(email: str, request: AccountStatusRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    require_admin(authorization)
+    admin = require_admin(authorization)
     normalized_email = email.strip().lower()
     if is_environment_account(normalized_email) and request.status == "suspended":
         raise HTTPException(status_code=400, detail="Configured environment accounts cannot be suspended here; update the project secret instead")
@@ -430,6 +499,7 @@ def admin_update_user_status(email: str, request: AccountStatusRequest, authoriz
         connection.commit()
     if request.status == "suspended":
         revoke_sessions_for_email(normalized_email)
+    record_audit(admin["email"], f"user.{request.status}", normalized_email, {"status": request.status})
     return {"email": normalized_email, "status": request.status}
 
 @app.get("/admin/system-status")
@@ -464,7 +534,23 @@ def admin_change_password(request: AdminPasswordRequest, authorization: str | No
         connection.execute("INSERT INTO users (email, name, password_hash, role, status, created_at) VALUES (?, ?, ?, 'admin', 'active', ?) ON CONFLICT(email) DO UPDATE SET password_hash = excluded.password_hash, role = 'admin', status = 'active'", (email, account.get("name", "Configured admin"), hash_password(request.new_password), int(time.time())))
         connection.commit()
     revoke_sessions_for_email(email)
+    record_audit(email, "admin.password_changed", email, {})
     return {"message": "Admin password updated. Sign in again with the new password."}
+
+@app.get("/admin/audit")
+def admin_audit(limit: int = 50, authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    require_admin(authorization)
+    limit = max(1, min(200, limit))
+    with auth_db() as connection:
+        rows = connection.execute("SELECT id, actor_email, action, target_email, details, created_at FROM audit_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            details = json.loads(row["details"])
+        except json.JSONDecodeError:
+            details = {}
+        events.append({"id": row["id"], "actor_email": row["actor_email"], "action": row["action"], "target_email": row["target_email"], "details": details, "created_at": row["created_at"]})
+    return events
 
 @app.get("/admin/data-quality")
 def admin_data_quality(authorization: str | None = Header(default=None)) -> dict[str, Any]:
