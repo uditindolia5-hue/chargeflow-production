@@ -131,13 +131,18 @@ AUTH_DB_PATH = Path(os.getenv("CHARGEFLOW_AUTH_DB_PATH", str(Path(__file__).reso
 DATABASE_URL = os.getenv("CHARGEFLOW_DATABASE_URL", "")
 TELEMETRY_URL = os.getenv("CHARGEFLOW_TELEMETRY_URL", "").strip()
 TELEMETRY_KEY = os.getenv("CHARGEFLOW_TELEMETRY_API_KEY", "").strip()
-TELEMETRY_CACHE: dict[str, Any] = {"updated_at": 0, "status": "fallback", "records": {}}
+TELEMETRY_STALE_SECONDS = max(60, int(os.getenv("CHARGEFLOW_TELEMETRY_STALE_SECONDS", "900")))
+TELEMETRY_CACHE: dict[str, Any] = {"updated_at": 0, "status": "fallback", "records": {}, "last_error": None}
 
 def mysql_url() -> str | None:
     return DATABASE_URL if DATABASE_URL.startswith(("mysql://", "mysql+pymysql://")) else None
 
 def telemetry_status() -> dict[str, Any]:
-    return {"configured": bool(TELEMETRY_URL and TELEMETRY_KEY), "provider": os.getenv("CHARGEFLOW_TELEMETRY_PROVIDER", "generic"), "status": TELEMETRY_CACHE["status"], "updated_at": TELEMETRY_CACHE["updated_at"], "records": len(TELEMETRY_CACHE["records"])}
+    updated_at = float(TELEMETRY_CACHE["updated_at"] or 0)
+    age_seconds = int(time.time() - updated_at) if updated_at else None
+    stale = bool(updated_at and age_seconds is not None and age_seconds > TELEMETRY_STALE_SECONDS)
+    status = "stale" if stale and TELEMETRY_CACHE["records"] else TELEMETRY_CACHE["status"]
+    return {"configured": bool(TELEMETRY_URL and TELEMETRY_KEY), "provider": os.getenv("CHARGEFLOW_TELEMETRY_PROVIDER", "generic"), "status": status, "updated_at": updated_at, "age_seconds": age_seconds, "stale_after_seconds": TELEMETRY_STALE_SECONDS, "records": len(TELEMETRY_CACHE["records"]), "last_error": TELEMETRY_CACHE["last_error"]}
 
 def refresh_telemetry(force: bool = False) -> dict[str, dict[str, Any]]:
     if not TELEMETRY_URL or not TELEMETRY_KEY:
@@ -156,8 +161,8 @@ def refresh_telemetry(force: bool = False) -> dict[str, dict[str, Any]]:
             if station_id:
                 records[station_id] = {key: row[key] for key in ("available_connectors", "occupied_connectors", "status", "updated_at") if key in row}
         TELEMETRY_CACHE.update({"updated_at": time.time(), "status": "connected", "records": records})
-    except (OSError, URLError, ValueError, json.JSONDecodeError):
-        TELEMETRY_CACHE.update({"updated_at": time.time(), "status": "fallback", "records": {}})
+    except (OSError, URLError, ValueError, json.JSONDecodeError) as error:
+        TELEMETRY_CACHE.update({"status": "stale" if TELEMETRY_CACHE["records"] else "fallback", "last_error": str(error)[:180]})
     return TELEMETRY_CACHE["records"]
 
 def with_telemetry(station: dict[str, Any]) -> dict[str, Any]:
@@ -167,7 +172,7 @@ def with_telemetry(station: dict[str, Any]) -> dict[str, Any]:
         if "available_connectors" in record: item["available_connectors"] = record["available_connectors"]
         if "occupied_connectors" in record: item["current_occupancy"] = record["occupied_connectors"]
         if "status" in record: item["live_status"] = record["status"]
-        item["telemetry_source"] = "live"
+        item["telemetry_source"] = "live-stale" if telemetry_status()["status"] == "stale" else "live"
     else:
         item["telemetry_source"] = "dataset-fallback"
     return item
@@ -758,6 +763,14 @@ def stations(limit: int = Query(default=50, ge=1, le=2000), city: str | None = N
 @app.get("/telemetry/status")
 def public_telemetry_status() -> dict[str, Any]:
     return telemetry_status()
+
+@app.post("/admin/telemetry/refresh")
+def admin_refresh_telemetry(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    admin = require_admin(authorization)
+    refresh_telemetry(force=True)
+    status = telemetry_status()
+    record_audit(admin["email"], "telemetry.refreshed", None, {"status": status["status"], "records": status["records"]})
+    return status
 
 @app.get("/network/summary")
 def network_summary(city: str | None = None) -> dict[str, Any]:

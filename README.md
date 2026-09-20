@@ -35,6 +35,8 @@ The profile page at `/profile` supports display-name changes, PNG/JPEG/WebP avat
 
 Telemetry is deliberately opt-in. If the URL or API key is missing, times out, or returns an unsupported payload, station responses remain dataset-backed and the admin control room reports **Dataset fallback** rather than failing recommendations. When configured, telemetry is cached for 60 seconds and overlays connector availability/status by matching `station_id` or `id` to the packaged station identifiers.
 
+Set `CHARGEFLOW_TELEMETRY_STALE_SECONDS` to control the stale threshold; it defaults to 900 seconds. A failed refresh retains the last known good records and marks them **Stale data** instead of silently presenting them as current. Administrators can use **Refresh telemetry** in the control room to force a provider request and create an audit event. The public `/telemetry/status` response exposes provider state, record count, age, stale threshold, and a bounded last-error message for diagnostics.
+
 ## Local development
 
 ```bash

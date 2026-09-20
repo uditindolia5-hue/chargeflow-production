@@ -40,6 +40,8 @@ class ChargeFlowBackendTests(unittest.TestCase):
         status = telemetry_status()
         self.assertFalse(status["configured"])
         self.assertEqual(status["status"], "fallback")
+        self.assertIn("stale_after_seconds", status)
+        self.assertIn("age_seconds", status)
 
     @unittest.skipUnless(os.getenv("CHARGEFLOW_ADMIN_EMAIL") and os.getenv("CHARGEFLOW_ADMIN_PASSWORD"), "requires configured admin secrets")
     def test_admin_control_room_reports_and_controls_users(self):
