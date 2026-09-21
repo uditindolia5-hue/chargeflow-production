@@ -6,6 +6,12 @@ import { clearSession, getSession } from "@/lib/auth";
 const API_BASE = "/python-api";
 type Vehicle = { id: number; name: string; preferred_plug: string; battery_percent: number };
 
+function normalizeVehicles(payload: unknown): Vehicle[] {
+  if (Array.isArray(payload)) return payload as Vehicle[];
+  if (payload && typeof payload === "object" && Array.isArray((payload as { vehicles?: unknown }).vehicles)) return (payload as { vehicles: Vehicle[] }).vehicles;
+  return [];
+}
+
 export default function Profile() {
   const [, navigate] = useLocation();
   const session = getSession();
@@ -36,7 +42,7 @@ export default function Profile() {
       setPreferredPlug(settings.preferred_plug ?? "CCS");
       setBatteryPercent(settings.battery_percent ?? 18);
       setCity(settings.city ?? "New Delhi");
-      setVehicles(vehicleRows as Vehicle[]);
+      setVehicles(normalizeVehicles(vehicleRows));
     }).catch(() => setError("Unable to load your profile right now.")).finally(() => setLoading(false));
   }, [navigate, session?.token]);
 
