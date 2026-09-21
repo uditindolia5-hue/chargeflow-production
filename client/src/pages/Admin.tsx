@@ -18,6 +18,24 @@ function formatBytes(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+async function fetchAdminJson<T>(path: string, headers: Record<string, string>): Promise<T> {
+  let lastMessage = "Request failed";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(`${API_BASE}/${path}`, { headers });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok) return payload as T;
+      if (response.status === 401 || response.status === 403) throw new Error("AUTH_REQUIRED");
+      lastMessage = `${path}: ${payload.detail ?? `HTTP ${response.status}`}`;
+    } catch (cause) {
+      if (cause instanceof Error && cause.message === "AUTH_REQUIRED") throw cause;
+      lastMessage = cause instanceof Error ? `${path}: ${cause.message}` : `${path}: Request failed`;
+    }
+    if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 180));
+  }
+  throw new Error(lastMessage);
+}
+
 export default function Admin() {
   const [, navigate] = useLocation();
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -41,24 +59,21 @@ export default function Admin() {
     setError("");
     try {
       const query = search ? `?search=${encodeURIComponent(search)}` : "";
-      const [overviewResponse, qualityResponse, usersResponse, systemResponse, auditResponse] = await Promise.all([
-        fetch(`${API_BASE}/admin/overview`, { headers }),
-        fetch(`${API_BASE}/admin/data-quality`, { headers }),
-        fetch(`${API_BASE}/admin/users${query}`, { headers }),
-        fetch(`${API_BASE}/admin/system-status`, { headers }),
-        fetch(`${API_BASE}/admin/audit?limit=50`, { headers }),
+      const [overviewData, qualityData, usersData, systemData, auditData] = await Promise.all([
+        fetchAdminJson<Overview>("admin/overview", headers),
+        fetchAdminJson<Quality>("admin/data-quality", headers),
+        fetchAdminJson<AdminUser[]>(`admin/users${query}`, headers),
+        fetchAdminJson<SystemStatus>("admin/system-status", headers),
+        fetchAdminJson<AuditEvent[]>("admin/audit?limit=50", headers),
       ]);
-      if ([overviewResponse, qualityResponse, usersResponse, systemResponse, auditResponse].some((response) => response.status === 401 || response.status === 403)) {
-        clearSession(); navigate("/login"); return;
-      }
-      if (![overviewResponse, qualityResponse, usersResponse, systemResponse, auditResponse].every((response) => response.ok)) throw new Error("One or more control-room services could not be loaded");
-      setOverview((await overviewResponse.json()) as Overview);
-      setQuality((await qualityResponse.json()) as Quality);
-      setUsers((await usersResponse.json()) as AdminUser[]);
-      setSystem((await systemResponse.json()) as SystemStatus);
-      setAuditEvents((await auditResponse.json()) as AuditEvent[]);
+      setOverview(overviewData);
+      setQuality(qualityData);
+      setUsers(usersData);
+      setSystem(systemData);
+      setAuditEvents(auditData);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Unable to load controls");
+      if (cause instanceof Error && cause.message === "AUTH_REQUIRED") { clearSession(); navigate("/login"); return; }
+      setError(cause instanceof Error ? cause.message : "Unable to load control-room data");
     } finally {
       setLoading(false); setRefreshing(false);
     }
