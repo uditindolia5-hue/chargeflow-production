@@ -71,6 +71,7 @@ export default function Admin() {
       setUsers(usersData);
       setSystem(systemData);
       setAuditEvents(auditData);
+      setError("");
     } catch (cause) {
       if (cause instanceof Error && cause.message === "AUTH_REQUIRED") { clearSession(); navigate("/login"); return; }
       setError(cause instanceof Error ? cause.message : "Unable to load control-room data");
