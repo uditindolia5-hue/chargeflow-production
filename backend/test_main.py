@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from backend import main
-from backend.main import AccountStatusRequest, AdminPasswordRequest, DashboardSettingsRequest, LoginRequest, ProfileUpdateRequest, RecommendationRequest, STATIONS, VehicleRequest, account_profile, account_settings, account_vehicles, add_account_vehicle, admin_audit, delete_account_vehicle, network_summary, predict_wait, recommend, telemetry_status, update_account_profile, update_account_settings
+from backend.main import AccountStatusRequest, AdminPasswordRequest, DashboardSettingsRequest, LoginRequest, ProfileUpdateRequest, RecommendationRequest, STATIONS, VehicleRequest, account_profile, account_settings, account_vehicles, add_account_vehicle, admin_audit, delete_account_vehicle, google_config, google_redirect_uri, network_summary, predict_wait, recommend, telemetry_status, update_account_profile, update_account_settings
 
 
 class ChargeFlowBackendTests(unittest.TestCase):
@@ -42,6 +42,14 @@ class ChargeFlowBackendTests(unittest.TestCase):
         self.assertEqual(status["status"], "fallback")
         self.assertIn("stale_after_seconds", status)
         self.assertIn("age_seconds", status)
+
+    def test_google_oauth_reports_configuration_and_rejects_unsafe_redirects(self):
+        self.assertEqual(google_config()["enabled"], bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")))
+        if os.getenv("GOOGLE_REDIRECT_URI"):
+            self.assertFalse(google_config("https://preview.example/python-api/auth/google/callback")["enabled"])
+        with self.assertRaises(Exception):
+            google_redirect_uri("https://evil.example/callback")
+        self.assertEqual(google_redirect_uri("https://chargeflow.example/python-api/auth/google/callback"), "https://chargeflow.example/python-api/auth/google/callback")
 
     @unittest.skipUnless(os.getenv("CHARGEFLOW_ADMIN_EMAIL") and os.getenv("CHARGEFLOW_ADMIN_PASSWORD"), "requires configured admin secrets")
     def test_admin_control_room_reports_and_controls_users(self):

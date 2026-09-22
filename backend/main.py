@@ -9,9 +9,10 @@ import platform
 import sqlite3
 import time
 import smtplib
+from http.cookies import SimpleCookie
 from email.message import EmailMessage
 from urllib.error import URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
@@ -536,24 +537,44 @@ def confirm_password_reset(request: PasswordResetConfirm) -> dict[str, str]:
         connection.commit()
     return {"message": "Password updated. You can now sign in."}
 
+def google_redirect_uri(value: str | None) -> str:
+    candidate = (value or os.getenv("GOOGLE_REDIRECT_URI", "")).strip()
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.path.endswith("/python-api/auth/google/callback"):
+        raise HTTPException(status_code=400, detail="Invalid Google redirect URI")
+    return candidate
+
+@app.get("/auth/google/config")
+def google_config(redirect_uri: str | None = None) -> dict[str, bool | str]:
+    configured = bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"))
+    registered_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+    matches = not registered_uri or not redirect_uri or registered_uri == redirect_uri
+    return {"enabled": configured and matches, "redirect_uri_configured": bool(registered_uri)}
+
 @app.get("/auth/google/start")
-def google_start():
+def google_start(redirect_uri: str | None = None):
     client_id = os.getenv("GOOGLE_CLIENT_ID")
-    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-    if not client_id:
+    if not client_id or not os.getenv("GOOGLE_CLIENT_SECRET"):
         raise HTTPException(status_code=503, detail="Google sign-in is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
+    callback_uri = google_redirect_uri(redirect_uri)
+    registered_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
+    if registered_uri and callback_uri != registered_uri:
+        raise HTTPException(status_code=400, detail="Google sign-in is configured for the production domain. Open the published ChargeFlow website to continue with Google.")
     state = secrets.token_urlsafe(24)
     GOOGLE_STATES.add(state)
-    params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code", "scope": "openid email profile", "state": state, "access_type": "online", "prompt": "select_account"}
-    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}")
+    params = {"client_id": client_id, "redirect_uri": callback_uri, "response_type": "code", "scope": "openid email profile", "state": state, "access_type": "online", "prompt": "select_account"}
+    response = RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}")
+    response.set_cookie("chargeflow_google_state", state, max_age=600, httponly=True, secure=True, samesite="lax", path="/")
+    return response
 
 @app.get("/auth/google/callback")
-def google_callback(code: str, state: str):
+def google_callback(code: str, state: str, cookie: str | None = Header(default=None)):
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-    if not client_id or not client_secret or state not in GOOGLE_STATES:
+    expected_state = SimpleCookie(cookie or "").get("chargeflow_google_state")
+    if not client_id or not client_secret or state not in GOOGLE_STATES or not expected_state or not hmac.compare_digest(state, expected_state.value):
         raise HTTPException(status_code=400, detail="Invalid or incomplete Google OAuth configuration")
+    redirect_uri = google_redirect_uri(os.getenv("GOOGLE_REDIRECT_URI"))
     GOOGLE_STATES.discard(state)
     token_payload = urlencode({"code": code, "client_id": client_id, "client_secret": client_secret, "redirect_uri": redirect_uri, "grant_type": "authorization_code"}).encode()
     token_request = UrlRequest("https://oauth2.googleapis.com/token", data=token_payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -563,9 +584,16 @@ def google_callback(code: str, state: str):
     with urlopen(profile_request, timeout=15) as profile_response:
         profile = json.loads(profile_response.read().decode())
     email = str(profile["email"]).lower()
-    token = create_session(email, "user", str(profile.get("name", "Google user")))
-    frontend = os.getenv("CHARGEFLOW_FRONTEND_URL", "http://localhost:3000")
-    return RedirectResponse(f"{frontend}/login?token={token}&email={urlencode({'email': email})[6:]}&role=user")
+    name = str(profile.get("name", "Google user"))
+    with auth_db() as connection:
+        connection.execute("INSERT INTO users (email, name, password_hash, role, status, created_at) VALUES (?, ?, ?, 'user', 'active', ?) ON CONFLICT(email) DO UPDATE SET name = excluded.name, status = 'active'", (email, name, f"google:{secrets.token_urlsafe(24)}", int(time.time())))
+        connection.commit()
+    token = create_session(email, "user", name)
+    parsed_redirect = urlparse(redirect_uri)
+    frontend = f"{parsed_redirect.scheme}://{parsed_redirect.netloc}"
+    response = RedirectResponse(f"{frontend}/login?token={urlencode({'token': token})[6:]}&email={urlencode({'email': email})[6:]}&role=user")
+    response.delete_cookie("chargeflow_google_state", path="/")
+    return response
 
 @app.get("/auth/me")
 def me(authorization: str | None = Header(default=None)) -> dict[str, str]:
