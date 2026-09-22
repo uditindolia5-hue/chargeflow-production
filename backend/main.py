@@ -93,6 +93,13 @@ class RegisterRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=200)
 
+class EmailVerificationRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+
+class EmailOnlyRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
 class PasswordResetRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
 
@@ -216,6 +223,7 @@ def auth_db() -> sqlite3.Connection:
             cursor = connection.cursor()
             cursor.execute("CREATE TABLE IF NOT EXISTS users (email VARCHAR(320) PRIMARY KEY, name VARCHAR(120) NOT NULL, password_hash TEXT NOT NULL, role VARCHAR(20) NOT NULL DEFAULT 'user', status VARCHAR(20) NOT NULL DEFAULT 'active', created_at BIGINT NOT NULL)")
             cursor.execute("CREATE TABLE IF NOT EXISTS password_resets (token VARCHAR(200) PRIMARY KEY, email VARCHAR(320) NOT NULL, expires_at BIGINT NOT NULL)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS email_verifications (email VARCHAR(320) PRIMARY KEY, name VARCHAR(120) NOT NULL, password_hash TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at BIGINT NOT NULL, attempts INT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL)")
             cursor.execute("CREATE TABLE IF NOT EXISTS profiles (email VARCHAR(320) PRIMARY KEY, display_name VARCHAR(120) NOT NULL, avatar_data LONGTEXT NULL, avatar_mime VARCHAR(80) NULL, updated_at BIGINT NOT NULL)")
             cursor.execute("CREATE TABLE IF NOT EXISTS user_settings (email VARCHAR(320) PRIMARY KEY, settings_json TEXT NOT NULL, updated_at BIGINT NOT NULL)")
             cursor.execute("CREATE TABLE IF NOT EXISTS user_vehicles (id BIGINT PRIMARY KEY AUTO_INCREMENT, email VARCHAR(320) NOT NULL, name VARCHAR(120) NOT NULL, preferred_plug VARCHAR(24) NOT NULL, battery_percent INT NOT NULL, created_at BIGINT NOT NULL)")
@@ -229,6 +237,7 @@ def auth_db() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS password_resets (token TEXT PRIMARY KEY, email TEXT NOT NULL, expires_at INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS email_verifications (email TEXT PRIMARY KEY, name TEXT NOT NULL, password_hash TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS profiles (email TEXT PRIMARY KEY, display_name TEXT NOT NULL, avatar_data TEXT, avatar_mime TEXT, updated_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS user_settings (email TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS user_vehicles (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, name TEXT NOT NULL, preferred_plug TEXT NOT NULL, battery_percent INTEGER NOT NULL, created_at INTEGER NOT NULL)")
@@ -278,6 +287,28 @@ def notify_admin_action(actor_email: str, action: str, target_email: str | None,
     except (OSError, smtplib.SMTPException):
         # Notifications must never make an otherwise successful admin action fail.
         return
+
+def send_verification_email(email: str, name: str, code: str) -> None:
+    host = os.getenv("CHARGEFLOW_SMTP_HOST", "").strip()
+    sender = os.getenv("CHARGEFLOW_SMTP_FROM", os.getenv("CHARGEFLOW_SMTP_USER", "")).strip()
+    username = os.getenv("CHARGEFLOW_SMTP_USER", "").strip()
+    password = os.getenv("CHARGEFLOW_SMTP_PASSWORD", "")
+    if not host or not sender:
+        raise HTTPException(status_code=503, detail="Email verification is not configured. Add the SMTP project secrets first.")
+    message = EmailMessage()
+    message["Subject"] = "Your ChargeFlow verification code"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(f"Hi {name},\n\nYour ChargeFlow verification code is: {code}\n\nThis code expires in 10 minutes. If you did not request this, you can ignore this email.\n")
+    try:
+        port = int(os.getenv("CHARGEFLOW_SMTP_PORT", "587"))
+        with smtplib.SMTP(host, port, timeout=10) as smtp:
+            smtp.starttls()
+            if username and password:
+                smtp.login(username, password)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException, ValueError) as error:
+        raise HTTPException(status_code=503, detail="Verification email could not be sent. Check the SMTP configuration.") from error
 
 def default_settings() -> dict[str, Any]:
     return {"vehicle_name": "Polestar 2 Long Range", "preferred_plug": "CCS", "battery_percent": 18, "city": "New Delhi"}
@@ -504,7 +535,7 @@ def login(request: LoginRequest) -> dict[str, str]:
     return {"token": token, "email": normalized_email, "role": account["role"]}
 
 @app.post("/auth/register")
-def register(request: RegisterRequest) -> dict[str, str]:
+def register(request: RegisterRequest) -> dict[str, str | bool]:
     normalized_email = request.email.strip().lower()
     if len(request.name.strip()) < 2 or "@" not in normalized_email:
         raise HTTPException(status_code=400, detail="Enter a valid name and email")
@@ -512,11 +543,58 @@ def register(request: RegisterRequest) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
     if normalized_email in {value["email"].lower() for value in configured_accounts().values()}:
         raise HTTPException(status_code=409, detail="An account with this email already exists")
+    code = str(secrets.randbelow(900000) + 100000)
     with auth_db() as connection:
-        connection.execute("INSERT INTO users (email, name, password_hash, role, status, created_at) VALUES (?, ?, ?, 'user', 'active', ?)", (normalized_email, request.name.strip(), hash_password(request.password), int(time.time())))
+        connection.execute("DELETE FROM email_verifications WHERE email = ?", (normalized_email,))
+        connection.execute("INSERT INTO email_verifications (email, name, password_hash, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)", (normalized_email, request.name.strip(), hash_password(request.password), hash_password(code), int(time.time()) + 600, int(time.time())))
         connection.commit()
-    token = create_session(normalized_email, "user", request.name.strip())
+    try:
+        send_verification_email(normalized_email, request.name.strip(), code)
+    except HTTPException:
+        with auth_db() as connection:
+            connection.execute("DELETE FROM email_verifications WHERE email = ?", (normalized_email,))
+            connection.commit()
+        raise
+    return {"verification_required": True, "email": normalized_email}
+
+@app.post("/auth/register/verify")
+def verify_registration(request: EmailVerificationRequest) -> dict[str, str]:
+    normalized_email = request.email.strip().lower()
+    with auth_db() as connection:
+        pending = connection.execute("SELECT name, password_hash, code_hash, expires_at, attempts FROM email_verifications WHERE email = ?", (normalized_email,)).fetchone()
+        if not pending:
+            raise HTTPException(status_code=400, detail="No pending verification was found. Start registration again.")
+        if int(pending["expires_at"]) < int(time.time()):
+            connection.execute("DELETE FROM email_verifications WHERE email = ?", (normalized_email,))
+            connection.commit()
+            raise HTTPException(status_code=400, detail="This verification code has expired. Request a new code.")
+        if int(pending["attempts"]) >= 5:
+            connection.execute("DELETE FROM email_verifications WHERE email = ?", (normalized_email,))
+            connection.commit()
+            raise HTTPException(status_code=429, detail="Too many incorrect codes. Start registration again.")
+        if not verify_password(request.code, pending["code_hash"]):
+            connection.execute("UPDATE email_verifications SET attempts = attempts + 1 WHERE email = ?", (normalized_email,))
+            connection.commit()
+            raise HTTPException(status_code=400, detail="That verification code is incorrect.")
+        connection.execute("INSERT INTO users (email, name, password_hash, role, status, created_at) VALUES (?, ?, ?, 'user', 'active', ?)", (normalized_email, pending["name"], pending["password_hash"], int(time.time())))
+        connection.execute("DELETE FROM email_verifications WHERE email = ?", (normalized_email,))
+        connection.commit()
+    token = create_session(normalized_email, "user", pending["name"])
     return {"token": token, "email": normalized_email, "role": "user"}
+
+@app.post("/auth/register/resend")
+def resend_registration_code(request: EmailOnlyRequest) -> dict[str, str | bool]:
+    normalized_email = request.email.strip().lower()
+    with auth_db() as connection:
+        pending = connection.execute("SELECT name FROM email_verifications WHERE email = ?", (normalized_email,)).fetchone()
+        if not pending:
+            raise HTTPException(status_code=400, detail="No pending verification was found. Start registration again.")
+    code = str(secrets.randbelow(900000) + 100000)
+    with auth_db() as connection:
+        connection.execute("UPDATE email_verifications SET code_hash = ?, expires_at = ?, attempts = 0, created_at = ? WHERE email = ?", (hash_password(code), int(time.time()) + 600, int(time.time()), normalized_email))
+        connection.commit()
+    send_verification_email(normalized_email, pending["name"], code)
+    return {"verification_required": True, "email": normalized_email}
 
 @app.post("/auth/password-reset/request")
 def request_password_reset(request: PasswordResetRequest) -> dict[str, str]:
