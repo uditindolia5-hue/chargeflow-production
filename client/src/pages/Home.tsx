@@ -200,6 +200,18 @@ export default function Home() {
 
   useEffect(() => {
     if (!sessionToken) return;
+    void fetch(`${PYTHON_API_BASE}/auth/me`, { headers: { Authorization: `Bearer ${sessionToken}` } })
+      .then((response) => {
+        if (!response.ok) throw new Error("inactive session");
+      })
+      .catch(() => {
+        clearSession();
+        navigate("/login");
+      });
+  }, [navigate, sessionToken]);
+
+  useEffect(() => {
+    if (!sessionToken) return;
     void fetch(`${PYTHON_API_BASE}/account/settings`, { headers: { Authorization: `Bearer ${sessionToken}` } })
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("Unable to load account settings")))
       .then((settings: { vehicle_name: string; preferred_plug: string; battery_percent: number; city: string }) => {

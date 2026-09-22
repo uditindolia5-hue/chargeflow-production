@@ -341,12 +341,24 @@ def create_session(email: str, role: str, name: str = "") -> str:
     SESSIONS[token] = {"email": email, "role": role, "name": name}
     return token
 
+def account_is_active(email: str, role: str) -> bool:
+    normalized = email.lower()
+    if role == "admin" and normalized == os.getenv("CHARGEFLOW_ADMIN_EMAIL", "").strip().lower():
+        return True
+    with auth_db() as connection:
+        row = connection.execute("SELECT role, status FROM users WHERE email = ?", (normalized,)).fetchone()
+    return bool(row and row["role"] == role and row["status"] == "active")
+
 def current_session(authorization: str | None) -> dict[str, str]:
     token = (authorization or "").removeprefix("Bearer ").strip()
     if not token or token in REVOKED_SESSIONS:
         raise HTTPException(status_code=401, detail="You must log in first")
     cached = SESSIONS.get(token)
     if cached:
+        if not account_is_active(cached["email"], cached["role"]):
+            SESSIONS.pop(token, None)
+            REVOKED_SESSIONS.add(token)
+            raise HTTPException(status_code=401, detail="Your account is no longer active")
         return cached
     try:
         encoded, signature = token.split(".", 1)
@@ -358,6 +370,8 @@ def current_session(authorization: str | None) -> dict[str, str]:
         if int(payload.get("exp", 0)) < int(time.time()):
             raise ValueError("expired")
         session = {"email": str(payload["email"]), "role": str(payload["role"]), "name": str(payload.get("name", ""))}
+        if not account_is_active(session["email"], session["role"]):
+            raise HTTPException(status_code=401, detail="Your account is no longer active")
         SESSIONS[token] = session
         return session
     except (ValueError, KeyError, TypeError, json.JSONDecodeError, base64.binascii.Error):

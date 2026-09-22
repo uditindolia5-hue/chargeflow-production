@@ -51,6 +51,15 @@ class ChargeFlowBackendTests(unittest.TestCase):
             google_redirect_uri("https://evil.example/callback")
         self.assertEqual(google_redirect_uri("https://chargeflow.example/python-api/auth/google/callback"), "https://chargeflow.example/python-api/auth/google/callback")
 
+    def test_deleted_account_session_is_rejected(self):
+        original_db_path = main.AUTH_DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.AUTH_DB_PATH = Path(directory) / "deleted-session.sqlite3"
+            token = main.create_session("removed@example.test", "user", "Removed User")
+            with self.assertRaises(Exception):
+                main.current_session(f"Bearer {token}")
+        main.AUTH_DB_PATH = original_db_path
+
     @unittest.skipUnless(os.getenv("CHARGEFLOW_ADMIN_EMAIL") and os.getenv("CHARGEFLOW_ADMIN_PASSWORD"), "requires configured admin secrets")
     def test_admin_control_room_reports_and_controls_users(self):
         original_db_path = main.AUTH_DB_PATH
